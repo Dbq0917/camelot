@@ -34,6 +34,12 @@ def _make_table(df, page=1, order=1, cols_x=(0, 100, 200), rows_y=(300, 200, 100
     return t
 
 
+def _fill_cells(table):
+    for row_idx, row in enumerate(table.cells):
+        for col_idx, cell in enumerate(row):
+            cell.text = str(table.df.iloc[row_idx, col_idx])
+
+
 def test_empty_tablelist_stack_returns_empty():
     out = TableList([]).stack_contiguous()
     assert len(out) == 0
@@ -162,3 +168,119 @@ def test_stack_does_not_mutate_input_tables():
     _ = TableList([t1, t2]).stack_contiguous()
     assert t2.rows == original_t2_rows  # input unchanged
     assert t1.df.shape == (1, 2)
+
+
+def test_position_match_stacks_shifted_columns_by_default():
+    df1 = pd.DataFrame([["1", "Alice"], ["2", "Bob"]])
+    df2 = pd.DataFrame([["3", "Charlie"]])
+    stacked = TableList(
+        [
+            _make_table(df1, cols_x=(0, 100, 200)),
+            _make_table(df2, page=2, cols_x=(2, 101, 202)),
+        ]
+    ).stack_contiguous()
+    assert len(stacked) == 1
+    assert stacked[0].df.shape == (3, 2)
+    assert list(stacked[0].df.iloc[:, 1]) == ["Alice", "Bob", "Charlie"]
+
+
+def test_position_match_rejects_different_column_layouts():
+    df1 = pd.DataFrame([["1", "Alice"]])
+    df2 = pd.DataFrame([["2", "Bob"]])
+    stacked = TableList(
+        [
+            _make_table(df1, cols_x=(0, 100, 200)),
+            _make_table(df2, page=2, cols_x=(0, 140, 240)),
+        ]
+    ).stack_contiguous()
+    assert len(stacked) == 2
+
+
+def test_position_match_respects_column_tolerance():
+    df1 = pd.DataFrame([["1", "Alice"]])
+    df2 = pd.DataFrame([["2", "Bob"]])
+    tables = [
+        _make_table(df1, cols_x=(0, 100, 200)),
+        _make_table(df2, page=2, cols_x=(0, 90, 210)),
+    ]
+    assert len(TableList(tables).stack_contiguous()) == 2
+    assert len(TableList(tables).stack_contiguous(column_tolerance=0.1)) == 1
+
+
+def test_position_match_preserves_first_tables_column_names():
+    df1 = pd.DataFrame([["1", "Alice"]], columns=["客户号", "姓名"])
+    df2 = pd.DataFrame([["2", "Bob"]], columns=["OCR_ID", "OCR_NAME"])
+    stacked = TableList(
+        [
+            _make_table(df1),
+            _make_table(df2, page=2, cols_x=(2, 101, 202)),
+        ]
+    ).stack_contiguous()
+    assert list(stacked[0].df.columns) == ["客户号", "姓名"]
+    assert list(stacked[0].df.iloc[:, 1]) == ["Alice", "Bob"]
+
+
+def test_position_match_drops_only_repeated_header():
+    header = ["ID", "Name"]
+    df1 = pd.DataFrame([header, ["1", "Alice"], ["2", "Bob"]])
+    df2 = pd.DataFrame([header, ["3", "Charlie"]])
+    stacked = TableList(
+        [
+            _make_table(df1, rows_y=(300, 200, 100, 0)),
+            _make_table(
+                df2,
+                page=2,
+                cols_x=(2, 101, 202),
+                rows_y=(300, 200, 100),
+            ),
+        ]
+    ).stack_contiguous()
+    assert len(stacked) == 1
+    assert stacked[0].df.shape == (4, 2)
+    assert list(stacked[0].df.iloc[0]) == header
+    assert "ID" not in stacked[0].df.iloc[1:].values.flatten().tolist()
+
+
+def test_position_match_can_keep_repeated_header():
+    header = ["ID", "Name"]
+    df1 = pd.DataFrame([header, ["1", "Alice"]])
+    df2 = pd.DataFrame([header, ["2", "Bob"]])
+    stacked = TableList(
+        [
+            _make_table(df1, rows_y=(300, 200, 100)),
+            _make_table(
+                df2,
+                page=2,
+                cols_x=(2, 101, 202),
+                rows_y=(300, 200, 100),
+            ),
+        ]
+    ).stack_contiguous(keep_first_header=True)
+    assert stacked[0].df.shape == (4, 2)
+
+
+def test_dropped_header_keeps_merged_cell_rows_aligned():
+    header = ["ID", "Name"]
+    df1 = pd.DataFrame([header, ["1", "Alice"], ["2", "Bob"]])
+    df2 = pd.DataFrame([header, ["3", "Charlie"]])
+    first = _make_table(df1, rows_y=(300, 200, 100, 0))
+    second = _make_table(
+        df2,
+        page=2,
+        cols_x=(2, 101, 202),
+        rows_y=(300, 200, 100),
+    )
+    _fill_cells(first)
+    _fill_cells(second)
+
+    # A merged header cell and a vertically merged body cell exercise the
+    # row-boundary logic without changing the underlying grid.
+    first.cells[0][0].right = False
+    first.cells[0][1].left = False
+    first.cells[1][0].bottom = False
+    first.cells[2][0].top = False
+
+    result = TableList([first, second]).stack_contiguous()[0]
+    assert result.shape == result.df.shape == (4, 2)
+    assert len(result.rows) == len(result.cells) == 4
+    assert result.data == result.df.astype(str).values.tolist()

@@ -1075,6 +1075,157 @@ class Table:
         conn.close()
 
 
+_COLUMN_POSITION_TOLERANCE = 0.05
+
+
+def _normalized_column_layout(table: Table):
+    """Return column centres/widths normalized to the table's x extent."""
+    cols = getattr(table, "cols", None)
+    if not cols:
+        return None
+    try:
+        arr = np.asarray(cols, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] == 0:
+        return None
+
+    x0 = np.minimum(arr[:, 0], arr[:, 1])
+    x1 = np.maximum(arr[:, 0], arr[:, 1])
+    left = float(x0.min())
+    right = float(x1.max())
+    span = right - left
+    if span <= 0 or not np.isfinite([left, right]).all():
+        return None
+
+    centres = ((x0 + x1) / 2 - left) / span
+    widths = (x1 - x0) / span
+    return centres, widths
+
+
+def _column_positions_match(first: Table, second: Table, tolerance: float) -> bool:
+    """Whether two tables have the same columns at the same x positions.
+
+    Positions are normalized to each table's own width so a scan shift or
+    uniform scale change between pages does not prevent stitching. The
+    comparison is deliberately based on column geometry rather than header
+    text: continuation pages often repeat no header at all.
+    """
+    if len(first.cols) != len(second.cols):
+        return False
+    first_layout = _normalized_column_layout(first)
+    second_layout = _normalized_column_layout(second)
+    if first_layout is None or second_layout is None:
+        return False
+
+    first_centres, first_widths = first_layout
+    second_centres, second_widths = second_layout
+    return bool(
+        np.max(np.abs(first_centres - second_centres)) <= tolerance
+        and np.max(np.abs(first_widths - second_widths)) <= tolerance
+    )
+
+
+def _header_values(row) -> tuple[str, ...]:
+    """Normalize a DataFrame row for repeated-header comparisons."""
+    values = []
+    for value in row:
+        if pd.isna(value):
+            values.append("")
+        else:
+            values.append(" ".join(str(value).split()).casefold())
+    return tuple(values)
+
+
+def _is_repeated_header(first: Table, second: Table) -> bool:
+    """Whether ``second`` starts with the same header row as ``first``."""
+    # A lone matching row is not enough evidence: treat only a repeated
+    # header followed by body rows as a header, so one-row data tables
+    # whose value happens to match the first page are not silently trimmed.
+    if first.df.empty or len(second.df) < 2:
+        return False
+    if first.df.shape[1] != second.df.shape[1]:
+        return False
+    return _header_values(first.df.iloc[0]) == _header_values(second.df.iloc[0])
+
+
+def _drop_leading_row(table: Table) -> None:
+    """Drop a repeated header from the DataFrame and its grid geometry."""
+    table.df = table.df.iloc[1:].reset_index(drop=True)
+    if table.rows:
+        table.rows = table.rows[1:]
+    if table.cells:
+        table.cells = table.cells[1:]
+
+
+def _table_bbox(table: Table):
+    """Return a usable current bbox, deriving the y extent from grid rows."""
+    bbox = getattr(table, "_bbox", None)
+    if bbox is not None:
+        return bbox
+    if not table.cols or not table.rows:
+        return None
+    return (
+        min(c[0] for c in table.cols),
+        table.rows[-1][1],
+        max(c[1] for c in table.cols),
+        table.rows[0][0],
+    )
+
+
+def _refresh_bbox_from_rows(table: Table) -> None:
+    """Refresh a table's vertical bbox after dropping its header row."""
+    bbox = _table_bbox(table)
+    if bbox is None or not table.rows:
+        return
+    table._bbox = (
+        bbox[0],
+        table.rows[-1][1],
+        bbox[2],
+        table.rows[0][0],
+    )
+
+
+def _shift_table_y(table: Table, dy: float) -> None:
+    """Shift row/cell y coordinates (PDF origin is bottom-left)."""
+    table.rows = [(top + dy, bottom + dy) for top, bottom in table.rows]
+    for row in table.cells:
+        for cell in row:
+            cell.y1 += dy
+            cell.y2 += dy
+            cell.lb = (cell.x1, cell.y1)
+            cell.lt = (cell.x1, cell.y2)
+            cell.rb = (cell.x2, cell.y1)
+            cell.rt = (cell.x2, cell.y2)
+    if table._bbox is not None:
+        table._bbox = (
+            table._bbox[0],
+            table._bbox[1] + dy,
+            table._bbox[2],
+            table._bbox[3] + dy,
+        )
+
+
+def _append_table_geometry(out: Table, nxt: Table) -> None:
+    """Place ``nxt`` directly below ``out`` and append its grid geometry."""
+    out_bbox = _table_bbox(out)
+    nxt_bbox = _table_bbox(nxt)
+    if out_bbox is None or nxt_bbox is None or not nxt.rows or not nxt.cells:
+        return
+
+    out._bbox = out_bbox
+    nxt._bbox = nxt_bbox
+    _shift_table_y(nxt, out_bbox[1] - nxt_bbox[3])
+    out.rows.extend(nxt.rows)
+    out.cells.extend(nxt.cells)
+    out._bbox = (
+        min(out_bbox[0], nxt._bbox[0]),
+        nxt._bbox[1],
+        max(out_bbox[2], nxt._bbox[2]),
+        out_bbox[3],
+    )
+
+
 def _vstack_run(run: list[Table], drop_repeated_header: bool = False) -> Table:
     """Vertically concatenate a run of contiguous Tables (#628 POC).
 
@@ -1098,58 +1249,33 @@ def _vstack_run(run: list[Table], drop_repeated_header: bool = False) -> Table:
         return copy.deepcopy(run[0])
 
     out = copy.deepcopy(run[0])
-    out_dfs = [out.df]
+    out_dfs = [out.df.copy()]
+    header = out.df.iloc[0] if not out.df.empty else None
 
     for nxt in run[1:]:
         nxt_copy = copy.deepcopy(nxt)
-        # Shift the upcoming table's geometry so its top sits at the
-        # current bottom of `out`. PDF coords: y0 = bottom, y1 = top
-        # within each table (rows are stored as (top_y, bottom_y) tuples
-        # within Table.rows; bbox is (x0, y0, x1, y1)).
-        #
-        # Geometry shifting needs both tables to carry a _bbox. Parser-
-        # built Tables always do; if either is missing one (a Table
-        # constructed without going through a parser), skip the geometry
-        # merge and just concatenate the DataFrames — the df is what
-        # callers of stack_contiguous overwhelmingly want, and a missing
-        # bbox means there's no meaningful page geometry to stitch.
-        if out._bbox is not None and nxt_copy._bbox is not None:
-            out_bottom = out._bbox[1]
-            nxt_top = nxt_copy._bbox[3]
-            dy = out_bottom - nxt_top
-            nxt_copy.rows = [(r0 + dy, r1 + dy) for (r0, r1) in nxt_copy.rows]
-            for row in nxt_copy.cells:
-                for cell in row:
-                    cell.y1 += dy
-                    cell.y2 += dy
-                    # lb/lt/rb/rt are snapshot tuples set in Cell.__init__;
-                    # rebuild them so plotting and any other downstream
-                    # geometry consumer sees the shifted coords.
-                    cell.lb = (cell.x1, cell.y1)
-                    cell.lt = (cell.x1, cell.y2)
-                    cell.rb = (cell.x2, cell.y1)
-                    cell.rt = (cell.x2, cell.y2)
-            nxt_copy._bbox = (
-                nxt_copy._bbox[0],
-                nxt_copy._bbox[1] + dy,
-                nxt_copy._bbox[2],
-                nxt_copy._bbox[3] + dy,
-            )
-            out.rows = out.rows + nxt_copy.rows
-            out.cells = out.cells + nxt_copy.cells
-            out._bbox = (
-                min(out._bbox[0], nxt_copy._bbox[0]),
-                nxt_copy._bbox[1],  # new bottom
-                max(out._bbox[2], nxt_copy._bbox[2]),
-                out._bbox[3],  # original top
-            )
+        if (
+            drop_repeated_header
+            and header is not None
+            and _is_repeated_header(out, nxt_copy)
+        ):
+            _drop_leading_row(nxt_copy)
+            _refresh_bbox_from_rows(nxt_copy)
+        if nxt_copy.df.empty:
+            continue
 
-        nxt_df = nxt_copy.df
-        if drop_repeated_header and not nxt_df.empty:
-            nxt_df = nxt_df.iloc[1:].reset_index(drop=True)
+        # Positional concatenation: keep the first table's column labels
+        # even when a parser/OCR pass on the next page generated different
+        # synthetic labels. `pd.concat` would otherwise take the union and
+        # silently add columns, breaking downstream consumers.
+        nxt_df = nxt_copy.df.copy()
+        if len(nxt_df.columns) == len(out_dfs[0].columns):
+            nxt_df.columns = out_dfs[0].columns
         out_dfs.append(nxt_df)
+        _append_table_geometry(out, nxt_copy)
 
-    out.df = pd.concat(out_dfs, ignore_index=True)
+    out.df = pd.concat(out_dfs, ignore_index=True, sort=False)
+    out.shape = out.df.shape
 
     # Average per-table quality metrics across the run. `confidence` is a
     # read-only @property derived from accuracy + whitespace (#659/#739),
@@ -1276,8 +1402,9 @@ class TableList:
 
     def stack_contiguous(
         self,
-        match: str = "column_count",
+        match: str = "column_positions",
         keep_first_header: bool = False,
+        column_tolerance: float = _COLUMN_POSITION_TOLERANCE,
     ) -> TableList:
         """Vertically stack tables that look like continuations across pages.
 
@@ -1290,20 +1417,30 @@ class TableList:
 
         Parameters
         ----------
-        match : str, optional (default: 'column_count')
+        match : str, optional (default: 'column_positions')
             How to decide whether two adjacent tables are continuations
             of each other.
 
+            * ``'column_positions'`` — same column count and matching
+              normalized x positions (within ``column_tolerance``). This
+              is the default: it stitches continuation pages even when
+              they omit the repeated header, while still refusing tables
+              whose columns are laid out differently.
             * ``'column_count'`` — same number of columns (the rule from
               #628's POC; the common case).
             * ``'first_row'`` — same column count *and* identical text
               in the first row (catches PDFs that repeat the header on
               every page).
         keep_first_header : bool, optional (default: False)
-            When ``match='first_row'``, the matching first row of every
-            continuation table is dropped (so the stacked table has
-            exactly one header row). Set to ``True`` to keep every
-            page's header row in the stacked output.
+            When ``match`` is ``'column_positions'`` or ``'first_row'``,
+            a continuation table whose first row matches the first table's
+            header has that row dropped (so the stacked table has exactly
+            one header row). Set to ``True`` to keep every page's header row.
+        column_tolerance : float, optional (default: 0.05)
+            Maximum difference between normalized column centres/widths
+            for ``match='column_positions'``. The default permits small
+            scan shifts and uniform scale differences while rejecting reflowed
+            or differently sized tables.
 
         Returns
         -------
@@ -1312,7 +1449,9 @@ class TableList:
             that don't continue from the previous one (different
             column count or different first row, depending on ``match``)
             are passed through unchanged. The originals in ``self`` are
-            not mutated.
+            not mutated. Stacked DataFrames keep the first table's column
+            labels; continuation rows are concatenated positionally so
+            downstream schemas do not change.
 
         Notes
         -----
@@ -1335,9 +1474,10 @@ class TableList:
           page-locally. Cells from the second-and-later tables are
           shifted to sit below the first table's bottom.
         """
-        if match not in ("column_count", "first_row"):
+        if match not in ("column_positions", "column_count", "first_row"):
             raise ValueError(
-                f"match must be 'column_count' or 'first_row', got {match!r}"
+                "match must be 'column_count' or 'first_row' or"
+                f" 'column_positions', got {match!r}"
             )
         if not self._tables:
             return TableList([])
@@ -1350,22 +1490,26 @@ class TableList:
                 run.append(table)
                 continue
             head = run[-1]
-            same_cols = len(head.cols) == len(table.cols)
-            same_header = same_cols and (
-                match != "first_row"
-                or (
+            if match == "column_positions":
+                same_cols = _column_positions_match(head, table, column_tolerance)
+            elif match == "first_row":
+                same_cols = len(head.cols) == len(table.cols) and (
                     list(head.df.iloc[0]) == list(table.df.iloc[0])
                     if not head.df.empty and not table.df.empty
                     else False
                 )
-            )
-            if same_cols and (match == "column_count" or same_header):
+            else:
+                same_cols = len(head.cols) == len(table.cols)
+
+            if same_cols:
                 run.append(table)
             else:
                 stitched.append(
                     _vstack_run(
                         run,
-                        drop_repeated_header=(match == "first_row")
+                        drop_repeated_header=(
+                            match in ("column_positions", "first_row")
+                        )
                         and not keep_first_header,
                     )
                 )
@@ -1374,7 +1518,7 @@ class TableList:
             stitched.append(
                 _vstack_run(
                     run,
-                    drop_repeated_header=(match == "first_row")
+                    drop_repeated_header=(match in ("column_positions", "first_row"))
                     and not keep_first_header,
                 )
             )
